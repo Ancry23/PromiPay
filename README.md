@@ -141,3 +141,8 @@ Con PostgreSQL usa `pg_dump` per i backup al posto di `backup_db`.
 ## Pannello admin
 
 `/admin/` (con un superuser) permette di gestire agenzie, lavori e pagamenti.
+
+## Note
+
+Progetto realizzato a scopo di studio. Parte del codice e stata sviluppata con l'aiuto di un assistente AI
+(Claude), usato per scrivere, rivedere e spiegare le singole funzionalita.
