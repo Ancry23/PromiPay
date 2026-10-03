@@ -17,6 +17,8 @@ class JobFilter(django_filters.FilterSet):
     status = django_filters.ChoiceFilter(choices=STATUS_CHOICES, method='filter_status')
     due_from = django_filters.DateFilter(field_name='due_date', lookup_expr='gte')
     due_to = django_filters.DateFilter(field_name='due_date', lookup_expr='lte')
+    first_from = django_filters.DateFilter(field_name='first_day', lookup_expr='gte')
+    first_to = django_filters.DateFilter(field_name='first_day', lookup_expr='lte')
 
     class Meta:
         model = Job

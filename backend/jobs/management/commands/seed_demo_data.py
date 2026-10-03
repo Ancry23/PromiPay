@@ -103,9 +103,12 @@ class Command(BaseCommand):
                     "daily_pay": entry["daily_pay"],
                     "contract_type": entry["contract_type"],
                     "payment_months": entry["payment_months"],
-                    "paid": entry["paid"],
                 },
             )
+            if entry["paid"] and not job.paid:
+                job.settle(on_date=job.due_date, note="Saldo (demo)")
+            else:
+                job.sync_paid_status()
 
             if created:
                 created_jobs += 1

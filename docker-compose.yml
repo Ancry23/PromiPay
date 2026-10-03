@@ -1,0 +1,42 @@
+# Production-like stack: PostgreSQL + Django/gunicorn + nginx serving the React build.
+# Usage: cp deploy/.env.production.example deploy/.env.production  (fill it in)
+#        docker compose up -d --build
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    env_file: deploy/.env.production
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    env_file: deploy/.env.production
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - static:/app/staticfiles
+      - media:/app/media
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "${PROMIPAY_PORT:-8080}:80"
+    volumes:
+      - static:/srv/static:ro
+
+volumes:
+  pgdata:
+  static:
+  media:

@@ -24,7 +24,7 @@ api.interceptors.response.use(
   (response) => response,
   async (error) => {
     const original = error.config;
-    const isAuthCall = original?.url?.startsWith("auth/token");
+    const isAuthCall = /^auth\/(token|logout|password\/reset)/.test(original?.url ?? "");
 
     if (error.response?.status !== 401 || !original || original._retried || isAuthCall) {
       return Promise.reject(error);

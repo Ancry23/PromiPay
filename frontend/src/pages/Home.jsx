@@ -192,14 +192,9 @@ export default function Home() {
               <span className="alert-label">In scadenza entro 7 giorni</span>
               <strong>{summary.due_soon_count}</strong>
             </article>
-            <article className="alert-row alert-neutral">
-              <span className="alert-label">Agenzie registrate</span>
-              <strong>{summary.total_agencies}</strong>
-            </article>
-            <article className="alert-row alert-success">
-              <span className="alert-label">Incassato</span>
-              <strong>{formatCurrency(summary.total_paid)}</strong>
-            </article>
+            <Link className="ghost-button link-button" to="/calendar">
+              Apri il calendario
+            </Link>
           </div>
         </section>
       </div>

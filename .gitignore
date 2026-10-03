@@ -19,3 +19,12 @@ frontend/dist/
 .vscode/
 .idea/
 .DS_Store
+
+# Runtime data
+backend/media/
+backend/backups/
+backend/staticfiles/
+deploy/.env.production
+
+# Generated documents
+*.pdf

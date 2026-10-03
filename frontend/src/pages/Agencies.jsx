@@ -1,6 +1,20 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import api, { apiErrorMessage, fetchAll } from "../api/axios";
 import Toast from "../components/Toast";
+import { formatCurrency } from "../utils/formatters";
+
+function reliability(stats) {
+  if (!stats || stats.paid_jobs === 0) return null;
+  if (stats.on_time_percent >= 80 && (stats.avg_delay_days ?? 0) <= 3) return { tone: "success", label: "Affidabile" };
+  if (stats.on_time_percent >= 50) return { tone: "warning", label: "A volte in ritardo" };
+  return { tone: "danger", label: "Spesso in ritardo" };
+}
+
+function describeDelay(days) {
+  if (days === null || days === undefined) return null;
+  if (days === 0) return "paga alla scadenza";
+  return days > 0 ? `in media ${days} gg di ritardo` : `in media ${Math.abs(days)} gg in anticipo`;
+}
 
 const initialForm = {
   name: "",
@@ -8,6 +22,7 @@ const initialForm = {
 
 export default function Agencies() {
   const [agencies, setAgencies] = useState([]);
+  const [stats, setStats] = useState({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [submitError, setSubmitError] = useState("");
@@ -24,7 +39,9 @@ export default function Agencies() {
     try {
       setLoading(true);
       setError("");
-      setAgencies(await fetchAll("agencies/"));
+      const [list, statsResponse] = await Promise.all([fetchAll("agencies/"), api.get("agencies/stats/")]);
+      setAgencies(list);
+      setStats(Object.fromEntries(statsResponse.data.map((row) => [row.agency_id, row])));
     } catch (err) {
       console.error("Errore API:", err);
       setError("Impossibile caricare le agenzie.");
@@ -169,7 +186,7 @@ export default function Agencies() {
           <ul className="agency-list">
             {agencies.map((agency) => (
               <li key={agency.id} className="agency-item">
-                <span>{agency.name}</span>
+                <AgencySummary name={agency.name} stats={stats[agency.id]} />
                 <div className="inline-actions">
                   <button className="ghost-button" type="button" onClick={() => startEdit(agency)}>
                     Modifica
@@ -213,5 +230,26 @@ export default function Agencies() {
         </div>
       ) : null}
     </section>
+  );
+}
+
+function AgencySummary({ name, stats }) {
+  const badge = reliability(stats);
+  const parts = [];
+  if (stats) {
+    parts.push(`${stats.jobs} lavori`);
+    if (stats.on_time_percent !== null) parts.push(`${stats.on_time_percent}% puntuali`);
+    const delay = describeDelay(stats.avg_delay_days);
+    if (delay) parts.push(delay);
+    if (Number(stats.outstanding) > 0) parts.push(`da incassare ${formatCurrency(stats.outstanding)}`);
+    if (stats.overdue_jobs > 0) parts.push(`${stats.overdue_jobs} in ritardo ora`);
+  }
+
+  return (
+    <div>
+      <strong>{name}</strong>{" "}
+      {badge ? <span className={`mini-badge tone-${badge.tone}`}>{badge.label}</span> : null}
+      {parts.length ? <p className="muted compact-line">{parts.join(" \u00b7 ")}</p> : null}
+    </div>
   );
 }

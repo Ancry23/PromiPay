@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import api, { apiErrorMessage, fetchAll, listResults } from "../api/axios";
+import JobDetailsModal from "../components/JobDetailsModal";
 import Toast from "../components/Toast";
 import { daysUntil } from "../utils/dueTone";
-import { formatCurrency, formatDate } from "../utils/formatters";
+import { formatCurrency, formatDate, todayIso } from "../utils/formatters";
 
 const PAGE_SIZE = 20;
 
@@ -27,16 +28,10 @@ const initialForm = {
   daily_pay: "",
   contract_type: "fixed",
   payment_months: 1,
-  paid: false,
+  mark_paid: false,
 };
 
 const initialFilters = { status: "", agency: "", search: "" };
-
-function todayIso() {
-  const now = new Date();
-  const offset = now.getTimezoneOffset() * 60000;
-  return new Date(now - offset).toISOString().slice(0, 10);
-}
 
 const contractLabel = (value) =>
   contractOptions.find((option) => option.value === value)?.label ?? value;
@@ -67,9 +62,11 @@ export default function Jobs() {
   const [deletingId, setDeletingId] = useState(null);
   const [jobToDelete, setJobToDelete] = useState(null);
   const [exporting, setExporting] = useState(false);
-  const [paymentsJobId, setPaymentsJobId] = useState(null);
+  const [detailsJobId, setDetailsJobId] = useState(null);
+  const [settlingId, setSettlingId] = useState(null);
 
   const isEditing = editingId !== null;
+  const editingJob = isEditing ? jobs.find((job) => job.id === editingId) : null;
   const totalPages = Math.max(1, Math.ceil(count / PAGE_SIZE));
   const clearToast = useCallback(() => setToast(null), []);
 
@@ -151,7 +148,7 @@ export default function Jobs() {
       daily_pay: form.daily_pay,
       contract_type: form.contract_type,
       payment_months: Number(form.payment_months),
-      paid: form.paid,
+      mark_paid: form.mark_paid,
     };
 
     if (!payload.agency_id || !payload.first_day || !payload.daily_pay) {
@@ -191,7 +188,7 @@ export default function Jobs() {
       daily_pay: job.daily_pay ?? "",
       contract_type: job.contract_type ?? "fixed",
       payment_months: job.payment_months ?? 1,
-      paid: Boolean(job.paid),
+      mark_paid: false,
     });
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
@@ -241,7 +238,21 @@ export default function Jobs() {
     }
   };
 
-  const paymentsJob = jobs.find((job) => job.id === paymentsJobId) ?? null;
+  const handleSettle = async (job) => {
+    try {
+      setSettlingId(job.id);
+      await api.post(`jobs/${job.id}/settle/`);
+      setToast({ type: "success", message: `Saldo di ${formatCurrency(job.amount_due)} registrato.` });
+      await loadJobs();
+    } catch (err) {
+      console.error("Errore saldo:", err);
+      setToast({ type: "error", message: "Registrazione saldo non riuscita." });
+    } finally {
+      setSettlingId(null);
+    }
+  };
+
+  const detailsJob = jobs.find((job) => job.id === detailsJobId) ?? null;
 
   return (
     <section className="page-grid">
@@ -316,10 +327,20 @@ export default function Jobs() {
             />
           </label>
 
-          <label className="field checkbox-field full-width">
-            <input type="checkbox" checked={form.paid} onChange={(event) => setField("paid", event.target.checked)} />
-            <span>Gia pagato</span>
-          </label>
+          {!editingJob?.paid ? (
+            <label className="field checkbox-field full-width">
+              <input
+                type="checkbox"
+                checked={form.mark_paid}
+                onChange={(event) => setField("mark_paid", event.target.checked)}
+              />
+              <span>Gia saldato (registra un pagamento per l'importo residuo)</span>
+            </label>
+          ) : (
+            <p className="muted compact-line full-width">
+              Lavoro saldato. Per riaprirlo elimina un pagamento da &laquo;Dettagli&raquo;.
+            </p>
+          )}
 
           {submitError ? <p className="error-text compact full-width">{submitError}</p> : null}
 
@@ -401,6 +422,7 @@ export default function Jobs() {
                   <th>Pagamento</th>
                   <th>Totale</th>
                   <th>Residuo</th>
+                  <th>Spese da rimb.</th>
                   <th>Scadenza</th>
                   <th>Stato</th>
                   <th>Azioni</th>
@@ -418,6 +440,7 @@ export default function Jobs() {
                     <td>{job.payment_months} mesi</td>
                     <td>{formatCurrency(job.total)}</td>
                     <td>{formatCurrency(job.amount_due)}</td>
+                    <td>{Number(job.expenses_to_reimburse) > 0 ? formatCurrency(job.expenses_to_reimburse) : "-"}</td>
                     <td>{formatDate(job.due_date)}</td>
                     <td>
                       <span className={job.paid ? "status status-paid" : "status status-open"}>
@@ -426,9 +449,20 @@ export default function Jobs() {
                     </td>
                     <td>
                       <div className="inline-actions">
-                        <button className="ghost-button" type="button" onClick={() => setPaymentsJobId(job.id)}>
-                          Pagamenti
+                        <button className="ghost-button" type="button" onClick={() => setDetailsJobId(job.id)}>
+                          Dettagli
+                          {job.attachments?.length ? ` (${job.attachments.length})` : ""}
                         </button>
+                        {!job.paid ? (
+                          <button
+                            className="secondary-button"
+                            type="button"
+                            disabled={settlingId === job.id}
+                            onClick={() => handleSettle(job)}
+                          >
+                            {settlingId === job.id ? "..." : "Salda"}
+                          </button>
+                        ) : null}
                         <button className="ghost-button" type="button" onClick={() => startEdit(job)}>
                           Modifica
                         </button>
@@ -474,10 +508,10 @@ export default function Jobs() {
         ) : null}
       </section>
 
-      {paymentsJob ? (
-        <PaymentsModal
-          job={paymentsJob}
-          onClose={() => setPaymentsJobId(null)}
+      {detailsJob ? (
+        <JobDetailsModal
+          job={detailsJob}
+          onClose={() => setDetailsJobId(null)}
           onChanged={async (message) => {
             setToast({ type: "success", message });
             await loadJobs();
@@ -491,7 +525,7 @@ export default function Jobs() {
             <h3 id="job-delete-title">Eliminare questo lavoro?</h3>
             <p className="muted">
               Stai per rimuovere il lavoro di <strong>{jobToDelete.agency?.name ?? "agenzia sconosciuta"}</strong> del{" "}
-              <strong>{formatDate(jobToDelete.first_day)}</strong>. Verranno eliminati anche i pagamenti registrati.
+              <strong>{formatDate(jobToDelete.first_day)}</strong>. Verranno eliminati anche pagamenti, spese e documenti.
             </p>
             <div className="actions-row">
               <button className="danger-button" type="button" onClick={handleDelete} disabled={deletingId !== null}>
@@ -510,108 +544,5 @@ export default function Jobs() {
         </div>
       ) : null}
     </section>
-  );
-}
-
-function PaymentsModal({ job, onClose, onChanged }) {
-  const [amount, setAmount] = useState(() => (Number(job.amount_due) > 0 ? job.amount_due : ""));
-  const [date, setDate] = useState(todayIso);
-  const [note, setNote] = useState("");
-  const [error, setError] = useState("");
-  const [busy, setBusy] = useState(false);
-
-  const addPayment = async (event) => {
-    event.preventDefault();
-    if (!amount || Number(amount) <= 0) {
-      setError("Inserisci un importo maggiore di zero.");
-      return;
-    }
-
-    try {
-      setBusy(true);
-      setError("");
-      await api.post("payments/", { job: job.id, amount, date, note: note.trim() });
-      setAmount("");
-      setNote("");
-      await onChanged("Pagamento registrato.");
-    } catch (err) {
-      setError(apiErrorMessage(err, "Registrazione pagamento non riuscita."));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const removePayment = async (paymentId) => {
-    try {
-      setBusy(true);
-      setError("");
-      await api.delete(`payments/${paymentId}/`);
-      await onChanged("Pagamento eliminato.");
-    } catch (err) {
-      setError(apiErrorMessage(err, "Eliminazione pagamento non riuscita."));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <div className="modal-backdrop" role="presentation">
-      <section className="modal-card modal-wide" aria-labelledby="payments-title">
-        <h3 id="payments-title">Pagamenti - {job.agency?.name ?? "-"}</h3>
-        <p className="muted">
-          Totale {formatCurrency(job.total)} &middot; Incassato {formatCurrency(job.amount_paid)} &middot; Residuo{" "}
-          <strong>{formatCurrency(job.amount_due)}</strong>
-        </p>
-
-        {job.payments?.length ? (
-          <ul className="payment-list">
-            {job.payments.map((payment) => (
-              <li key={payment.id} className="agency-item">
-                <span>
-                  <strong>{formatCurrency(payment.amount)}</strong> il {formatDate(payment.date)}
-                  {payment.note ? <span className="muted compact-line"> &middot; {payment.note}</span> : null}
-                </span>
-                <button
-                  className="danger-button"
-                  type="button"
-                  disabled={busy}
-                  onClick={() => removePayment(payment.id)}
-                >
-                  Elimina
-                </button>
-              </li>
-            ))}
-          </ul>
-        ) : (
-          <p className="muted">Nessun pagamento registrato.</p>
-        )}
-
-        <form className="form-grid two-columns payment-form" onSubmit={addPayment}>
-          <label className="field">
-            <span>Importo</span>
-            <input type="number" min="0.01" step="0.01" value={amount} onChange={(event) => setAmount(event.target.value)} />
-          </label>
-          <label className="field">
-            <span>Data incasso</span>
-            <input type="date" value={date} onChange={(event) => setDate(event.target.value)} />
-          </label>
-          <label className="field full-width">
-            <span>Nota (opzionale)</span>
-            <input type="text" value={note} maxLength={255} onChange={(event) => setNote(event.target.value)} />
-          </label>
-
-          {error ? <p className="error-text compact full-width">{error}</p> : null}
-
-          <div className="actions-row full-width">
-            <button className="primary-button" type="submit" disabled={busy}>
-              {busy ? "Attendere..." : "Registra pagamento"}
-            </button>
-            <button className="secondary-button" type="button" onClick={onClose} disabled={busy}>
-              Chiudi
-            </button>
-          </div>
-        </form>
-      </section>
-    </div>
   );
 }

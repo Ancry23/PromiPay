@@ -14,6 +14,7 @@ import os
 from datetime import timedelta
 from pathlib import Path
 
+import dj_database_url
 from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
 
@@ -65,6 +66,7 @@ INSTALLED_APPS = [
     #third party app
     "rest_framework",
     "rest_framework_simplejwt",
+    "rest_framework_simplejwt.token_blacklist",
     "corsheaders",
     "django_filters",
 
@@ -107,11 +109,15 @@ WSGI_APPLICATION = "backend.wsgi.application"
 # Database
 # https://docs.djangoproject.com/en/4.2/ref/settings/#databases
 
+# DATABASE_URL (es. postgres://user:pass@host:5432/promipay) ha la precedenza;
+# altrimenti si usa SQLite nel percorso DJANGO_DB_PATH.
+SQLITE_PATH = Path(os.environ.get("DJANGO_DB_PATH", BASE_DIR / "db.sqlite3"))
+
 DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.sqlite3",
-        "NAME": os.environ.get("DJANGO_DB_PATH", BASE_DIR / "db.sqlite3"),
-    }
+    "default": dj_database_url.config(
+        default=f"sqlite:///{SQLITE_PATH}",
+        conn_max_age=int(os.environ.get("DJANGO_DB_CONN_MAX_AGE", "60")),
+    )
 }
 
 
@@ -144,6 +150,22 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/4.2/howto/static-files/
 
 STATIC_URL = "static/"
+STATIC_ROOT = Path(os.environ.get("DJANGO_STATIC_ROOT", BASE_DIR / "staticfiles"))
+
+# Uploaded attachments. They are served only through the authenticated API, never as public URLs.
+MEDIA_ROOT = Path(os.environ.get("DJANGO_MEDIA_ROOT", BASE_DIR / "media"))
+MAX_ATTACHMENT_SIZE = int(os.environ.get("MAX_ATTACHMENT_SIZE_MB", "10")) * 1024 * 1024
+ALLOWED_ATTACHMENT_EXTENSIONS = [".pdf", ".jpg", ".jpeg", ".png", ".heic", ".webp"]
+
+# Where the SPA runs: used to build password-reset links sent by email.
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5173").rstrip("/")
+
+# Fiscal summary (indicative estimates, not tax advice)
+OCCASIONAL_WITHHOLDING_RATE = float(os.environ.get("OCCASIONAL_WITHHOLDING_RATE", "0.20"))
+OCCASIONAL_INPS_THRESHOLD = float(os.environ.get("OCCASIONAL_INPS_THRESHOLD", "5000"))
+
+# Database backups (python manage.py backup_db)
+BACKUP_DIR = Path(os.environ.get("DJANGO_BACKUP_DIR", BASE_DIR / "backups"))
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/4.2/ref/settings/#default-auto-field
@@ -156,18 +178,37 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "rest_framework_simplejwt.authentication.JWTAuthentication",
-        "rest_framework.authentication.SessionAuthentication",
+    ],
+    "DEFAULT_RENDERER_CLASSES": [
+        "rest_framework.renderers.JSONRenderer",
     ],
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.IsAuthenticated",
     ],
     "DEFAULT_PAGINATION_CLASS": "jobs.pagination.StandardPagination",
     "PAGE_SIZE": 20,
+    "DEFAULT_THROTTLE_RATES": {
+        "login": os.environ.get("THROTTLE_LOGIN", "10/min"),
+        "register": os.environ.get("THROTTLE_REGISTER", "5/hour"),
+        "password_reset": os.environ.get("THROTTLE_PASSWORD_RESET", "5/hour"),
+    },
 }
+
+# The browsable API (and the session login it needs) is a development aid only.
+if DEBUG:
+    REST_FRAMEWORK["DEFAULT_AUTHENTICATION_CLASSES"].append(
+        "rest_framework.authentication.SessionAuthentication"
+    )
+    REST_FRAMEWORK["DEFAULT_RENDERER_CLASSES"].append(
+        "rest_framework.renderers.BrowsableAPIRenderer"
+    )
 
 SIMPLE_JWT = {
     "ACCESS_TOKEN_LIFETIME": timedelta(minutes=30),
     "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
+    # Each refresh issues a new refresh token and invalidates the old one; logout blacklists it.
+    "ROTATE_REFRESH_TOKENS": True,
+    "BLACKLIST_AFTER_ROTATION": True,
 }
 
 
@@ -185,6 +226,10 @@ EMAIL_USE_TLS = env_bool("EMAIL_USE_TLS", False)
 # Security hardening when DEBUG is off
 
 if not DEBUG:
+    CSRF_TRUSTED_ORIGINS = env_list("CSRF_TRUSTED_ORIGINS", "")
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+    SECURE_SSL_REDIRECT = env_bool("DJANGO_SSL_REDIRECT", False)
+    SECURE_HSTS_SECONDS = int(os.environ.get("DJANGO_HSTS_SECONDS", "0"))
     SESSION_COOKIE_SECURE = env_bool("DJANGO_SECURE_COOKIES", True)
     CSRF_COOKIE_SECURE = env_bool("DJANGO_SECURE_COOKIES", True)
     SECURE_CONTENT_TYPE_NOSNIFF = True

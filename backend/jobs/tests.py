@@ -1,16 +1,21 @@
+import os
+import tempfile
+import time
 from datetime import date, timedelta
 from decimal import Decimal
 from io import StringIO
 
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 from django.core import mail
 from django.core.management import call_command
-from django.test import TestCase
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import TestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APITestCase
 
 from .dates import add_months
-from .models import Agency, Job, Payment
+from .models import Agency, Attachment, Expense, Job, Payment
 
 User = get_user_model()
 
@@ -47,13 +52,23 @@ class JobModelTests(TestCase):
         self.assertEqual(job.total, Decimal("226.50"))
         self.assertEqual(job.due_date, date(2026, 6, 1))
 
-    def test_paid_on_follows_paid_flag(self):
-        job = self.make_job(paid=True)
-        self.assertEqual(job.paid_on, timezone.localdate())
+    def test_settle_records_remaining_amount(self):
+        job = self.make_job()
+        Payment.objects.create(job=job, amount=Decimal("26.50"), date=date(2026, 5, 1))
+        job.settle(on_date=date(2026, 6, 1))
 
-        job.paid = False
+        self.assertTrue(job.paid)
+        self.assertEqual(job.paid_on, date(2026, 6, 1))
+        self.assertEqual(job.payments.last().amount, Decimal("200.00"))
+
+    def test_changing_total_reopens_settled_job(self):
+        job = self.make_job()
+        job.settle()
+        job.work_days = 4
         job.save()
-        self.assertIsNone(job.paid_on)
+        job.sync_paid_status()
+        self.assertFalse(job.paid)
+        self.assertEqual(job.amount_due, Decimal("75.50"))
 
     def test_partial_payments_update_amounts_and_status(self):
         job = self.make_job()
@@ -70,6 +85,9 @@ class JobModelTests(TestCase):
 
 
 class AuthApiTests(APITestCase):
+    def setUp(self):
+        cache.clear()  # reset throttling counters between tests
+
     def test_api_requires_authentication(self):
         self.assertEqual(self.client.get("/api/jobs/").status_code, 401)
         self.assertEqual(self.client.get("/api/agencies/").status_code, 401)
@@ -162,13 +180,18 @@ class JobApiTests(AuthenticatedApiTestCase):
 
         update_response = self.client.put(
             f"/api/jobs/{job_id}/",
-            self.job_payload(work_days=5, contract_type="occasional", paid=True),
+            self.job_payload(work_days=5, contract_type="occasional", mark_paid=True),
             format="json",
         )
         self.assertEqual(update_response.status_code, 200)
         self.assertEqual(update_response.data["total"], "400.00")
         self.assertTrue(update_response.data["paid"])
         self.assertIsNotNone(update_response.data["paid_on"])
+        self.assertEqual(Payment.objects.get(job_id=job_id).amount, Decimal("400.00"))
+
+        # "paid" is derived from payments: writing it directly has no effect.
+        ignored = self.client.patch(f"/api/jobs/{job_id}/", {"paid": False}, format="json")
+        self.assertTrue(ignored.data["paid"])
 
         delete_response = self.client.delete(f"/api/jobs/{job_id}/")
         self.assertEqual(delete_response.status_code, 204)
@@ -216,10 +239,13 @@ class JobStatusAndSummaryTests(AuthenticatedApiTestCase):
 
         def job(first_day, paid=False, months=1, daily_pay="100.00"):
             # payment_months=1 => due date one calendar month after first_day
-            return Job.objects.create(
+            created = Job.objects.create(
                 owner=self.user, agency=self.agency, first_day=first_day, work_days=1,
-                daily_pay=Decimal(daily_pay), payment_months=months, paid=paid,
+                daily_pay=Decimal(daily_pay), payment_months=months,
             )
+            if paid:
+                created.settle()
+            return created
 
         self.overdue = job(add_months(today, -1) - timedelta(days=3))
         self.due_soon = job(add_months(today + timedelta(days=3), -1))
@@ -336,3 +362,234 @@ class CommandTests(TestCase):
         self.assertEqual(mail.outbox[0].to, ["mario@example.com"])
         self.assertIn("IN RITARDO", mail.outbox[0].body)
         self.assertEqual(mail.outbox[0].body.count("Late Payer"), 1)
+
+
+class AccountSecurityTests(APITestCase):
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create_user("mario", email="mario@example.com", password="pw-Sicura-123")
+
+    def login(self, password="pw-Sicura-123"):
+        return self.client.post("/api/auth/token/", {"username": "mario", "password": password}, format="json")
+
+    def test_logout_blacklists_refresh_token(self):
+        tokens = self.login().data
+        response = self.client.post("/api/auth/logout/", {"refresh": tokens["refresh"]}, format="json")
+        self.assertEqual(response.status_code, 200)
+
+        refresh = self.client.post("/api/auth/token/refresh/", {"refresh": tokens["refresh"]}, format="json")
+        self.assertEqual(refresh.status_code, 401)
+
+    def test_refresh_rotates_tokens(self):
+        tokens = self.login().data
+        first = self.client.post("/api/auth/token/refresh/", {"refresh": tokens["refresh"]}, format="json")
+        self.assertIn("refresh", first.data)
+        reused = self.client.post("/api/auth/token/refresh/", {"refresh": tokens["refresh"]}, format="json")
+        self.assertEqual(reused.status_code, 401)
+
+    def test_login_is_throttled(self):
+        statuses = [self.login(password="sbagliata").status_code for _ in range(11)]
+        self.assertEqual(statuses[-1], 429)
+
+    def test_change_password(self):
+        tokens = self.login().data
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {tokens['access']}")
+
+        wrong = self.client.post(
+            "/api/auth/password/change/",
+            {"old_password": "nope", "new_password": "Nuova-pw-456"},
+            format="json",
+        )
+        self.assertEqual(wrong.status_code, 400)
+
+        response = self.client.post(
+            "/api/auth/password/change/",
+            {"old_password": "pw-Sicura-123", "new_password": "Nuova-pw-456"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("access", response.data)
+        self.client.credentials()
+        self.assertEqual(self.login("Nuova-pw-456").status_code, 200)
+        # Old refresh tokens are revoked.
+        old = self.client.post("/api/auth/token/refresh/", {"refresh": tokens["refresh"]}, format="json")
+        self.assertEqual(old.status_code, 401)
+
+    def test_password_reset_flow(self):
+        unknown = self.client.post("/api/auth/password/reset/", {"email": "nessuno@example.com"}, format="json")
+        self.assertEqual(unknown.status_code, 200)
+        self.assertEqual(len(mail.outbox), 0)
+
+        self.client.post("/api/auth/password/reset/", {"email": "MARIO@example.com"}, format="json")
+        self.assertEqual(len(mail.outbox), 1)
+        link = next(line for line in mail.outbox[0].body.splitlines() if "reset-password" in line)
+        query = dict(part.split("=", 1) for part in link.split("?", 1)[1].split("&"))
+
+        bad = self.client.post(
+            "/api/auth/password/reset/confirm/",
+            {"uid": query["uid"], "token": "token-falso", "new_password": "Nuova-pw-456"},
+            format="json",
+        )
+        self.assertEqual(bad.status_code, 400)
+
+        ok = self.client.post(
+            "/api/auth/password/reset/confirm/",
+            {"uid": query["uid"], "token": query["token"], "new_password": "Nuova-pw-456"},
+            format="json",
+        )
+        self.assertEqual(ok.status_code, 200)
+        self.assertEqual(self.login("Nuova-pw-456").status_code, 200)
+
+        reused = self.client.post(
+            "/api/auth/password/reset/confirm/",
+            {"uid": query["uid"], "token": query["token"], "new_password": "Altra-pw-789"},
+            format="json",
+        )
+        self.assertEqual(reused.status_code, 400)
+
+    def test_update_email(self):
+        self.client.force_authenticate(self.user)
+        response = self.client.patch("/api/auth/me/", {"email": "nuova@example.com", "username": "hack"}, format="json")
+        self.assertEqual(response.data["email"], "nuova@example.com")
+        self.assertEqual(response.data["username"], "mario")
+
+
+class ExpenseApiTests(AuthenticatedApiTestCase):
+    def setUp(self):
+        super().setUp()
+        self.job = Job.objects.create(
+            owner=self.user, agency=self.agency, first_day=date(2026, 4, 1), work_days=1, daily_pay=100
+        )
+
+    def test_expenses_totals_on_job(self):
+        self.client.post(
+            "/api/expenses/",
+            {"job": self.job.id, "category": "travel", "amount": "25.00", "reimbursable": True},
+            format="json",
+        )
+        self.client.post(
+            "/api/expenses/",
+            {"job": self.job.id, "category": "meal", "amount": "10.00", "reimbursable": False, "reimbursed": True},
+            format="json",
+        )
+        job = self.client.get(f"/api/jobs/{self.job.id}/").data
+        self.assertEqual(job["expenses_total"], "35.00")
+        self.assertEqual(job["expenses_to_reimburse"], "25.00")
+        # Non-reimbursable expenses can never be "reimbursed".
+        self.assertFalse(Expense.objects.get(category="meal").reimbursed)
+
+    def test_cannot_add_expense_to_foreign_job(self):
+        foreign_agency = Agency.objects.create(owner=self.other, name="Foreign")
+        foreign_job = Job.objects.create(
+            owner=self.other, agency=foreign_agency, first_day=date(2026, 1, 1), work_days=1, daily_pay=10
+        )
+        response = self.client.post("/api/expenses/", {"job": foreign_job.id, "amount": "5"}, format="json")
+        self.assertEqual(response.status_code, 400)
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp(prefix="promipay-test-media-"))
+class AttachmentApiTests(AuthenticatedApiTestCase):
+    def setUp(self):
+        super().setUp()
+        self.job = Job.objects.create(
+            owner=self.user, agency=self.agency, first_day=date(2026, 4, 1), work_days=1, daily_pay=100
+        )
+
+    def upload(self, name="contratto.pdf", content=b"%PDF-1.4 test", job=None):
+        return self.client.post(
+            "/api/attachments/",
+            {"job": (job or self.job).id, "file": SimpleUploadedFile(name, content)},
+            format="multipart",
+        )
+
+    def test_upload_download_delete(self):
+        response = self.upload()
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["name"], "contratto.pdf")
+        attachment = Attachment.objects.get()
+        path = attachment.file.path
+
+        download = self.client.get(f"/api/attachments/{attachment.id}/download/")
+        self.assertEqual(download.status_code, 200)
+        self.assertEqual(b"".join(download.streaming_content), b"%PDF-1.4 test")
+
+        self.client.force_authenticate(self.other)
+        self.assertEqual(self.client.get(f"/api/attachments/{attachment.id}/download/").status_code, 404)
+
+        self.client.force_authenticate(self.user)
+        self.assertEqual(self.client.delete(f"/api/attachments/{attachment.id}/").status_code, 204)
+        self.assertFalse(os.path.exists(path))
+
+    def test_deleting_job_removes_files(self):
+        self.upload()
+        path = Attachment.objects.get().file.path
+        self.client.delete(f"/api/jobs/{self.job.id}/")
+        self.assertFalse(os.path.exists(path))
+
+    def test_rejects_bad_extension_and_large_files(self):
+        self.assertEqual(self.upload(name="virus.exe").status_code, 400)
+        with self.settings(MAX_ATTACHMENT_SIZE=10):
+            self.assertEqual(self.upload(content=b"x" * 11).status_code, 400)
+
+
+class FiscalAndStatsTests(AuthenticatedApiTestCase):
+    def setUp(self):
+        super().setUp()
+        self.late_agency = Agency.objects.create(owner=self.user, name="Late Agency")
+
+        occasional = Job.objects.create(
+            owner=self.user, agency=self.agency, first_day=date(2026, 1, 10), work_days=10,
+            daily_pay=Decimal("100.00"), contract_type="occasional",
+        )  # due 2026-02-10
+        Payment.objects.create(job=occasional, amount=Decimal("1000.00"), date=date(2026, 2, 5))
+        occasional.sync_paid_status()
+
+        fixed = Job.objects.create(
+            owner=self.user, agency=self.late_agency, first_day=date(2026, 3, 1), work_days=5,
+            daily_pay=Decimal("80.00"), contract_type="fixed",
+        )  # due 2026-04-01
+        Payment.objects.create(job=fixed, amount=Decimal("400.00"), date=date(2026, 4, 21))
+        fixed.sync_paid_status()
+
+        Job.objects.create(
+            owner=self.user, agency=self.agency, first_day=date(2025, 12, 1), work_days=1, daily_pay=Decimal("50.00")
+        )
+        Expense.objects.create(job=fixed, date=date(2026, 3, 1), amount=Decimal("20.00"), reimbursable=True)
+
+    def test_fiscal_summary(self):
+        data = self.client.get("/api/jobs/fiscal/?year=2026").data
+        self.assertEqual(data["totals"]["gross"], "1400.00")
+        self.assertEqual(data["totals"]["received"], "1400.00")
+        self.assertEqual(data["totals"]["withholding_estimate"], "200.00")  # 20% of 1000 occasional
+        self.assertEqual(data["totals"]["net_estimate"], "1200.00")
+        self.assertEqual(data["totals"]["expenses_to_reimburse"], "20.00")
+        self.assertEqual(data["occasional"]["received"], "1000.00")
+        self.assertEqual(data["occasional"]["remaining"], "4000.00")
+        self.assertFalse(data["occasional"]["over_threshold"])
+        self.assertEqual(data["by_month"][0]["gross"], "1000.00")
+        self.assertEqual(data["by_month"][1]["received"], "1000.00")
+        self.assertIn(2025, data["years_available"])
+        self.assertEqual(self.client.get("/api/jobs/fiscal/?year=abc").status_code, 400)
+
+    def test_agency_stats(self):
+        rows = {r["name"]: r for r in self.client.get("/api/agencies/stats/").data}
+        self.assertEqual(rows["Agency One"]["on_time_percent"], 100)
+        self.assertEqual(rows["Agency One"]["avg_delay_days"], -5.0)
+        self.assertEqual(rows["Agency One"]["open_jobs"], 1)
+        self.assertEqual(rows["Late Agency"]["avg_delay_days"], 20.0)
+        self.assertEqual(rows["Late Agency"]["on_time_percent"], 0)
+
+    def test_calendar_filters(self):
+        response = self.client.get("/api/jobs/?first_from=2026-01-01&first_to=2026-03-31")
+        self.assertEqual(response.data["count"], 2)
+
+
+class BackupCommandTests(TestCase):
+    def test_backup_creates_file_and_rotates(self):
+        target = tempfile.mkdtemp(prefix="promipay-test-backup-")
+        for _ in range(3):
+            call_command("backup_db", "--dir", target, "--keep", "2", stdout=StringIO())
+            time.sleep(1.1)  # file names have one-second resolution
+        files = sorted(os.listdir(target))
+        self.assertEqual(len(files), 2)
+        self.assertTrue(all(f.startswith("promipay_") for f in files))

@@ -17,3 +17,16 @@ export function formatDate(value) {
     year: "2-digit",
   }).format(date);
 }
+
+export function todayIso() {
+  const now = new Date();
+  const offset = now.getTimezoneOffset() * 60000;
+  return new Date(now - offset).toISOString().slice(0, 10);
+}
+
+export function formatFileSize(bytes) {
+  const value = Number(bytes ?? 0);
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(0)} KB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+}
